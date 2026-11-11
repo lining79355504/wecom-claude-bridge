@@ -22,6 +22,15 @@ function list(name, fallback = '') {
     .filter(Boolean);
 }
 
+function bool(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const v = raw.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+  if (['0', 'false', 'no', 'off'].includes(v)) return false;
+  throw new Error(`配置 ${name} 必须是 true/false，当前值: ${raw}`);
+}
+
 function num(name, fallback) {
   const raw = process.env[name];
   if (!raw || !raw.trim()) return fallback;
@@ -69,6 +78,14 @@ export const config = {
     return num('CLAUDE_MAX_TURNS', 30);
   },
 
+  get permissionMode() {
+    const mode = process.env.CLAUDE_PERMISSION_MODE?.trim() || 'default';
+    if (!['default', 'acceptEdits', 'auto'].includes(mode)) {
+      throw new Error('CLAUDE_PERMISSION_MODE 必须是 default、acceptEdits 或 auto');
+    }
+    return mode;
+  },
+
   // 单个会话空闲多久后丢弃上下文（毫秒），默认 30 分钟
   get sessionTtlMs() {
     return num('SESSION_TTL_MS', 30 * 60 * 1000);
@@ -87,6 +104,12 @@ export const config = {
   // 明确禁止的工具，任何情况下都不执行
   get deniedTools() {
     return list('DENIED_TOOLS');
+  },
+
+  // Bash 里判定为纯只读的命令（ls/cat/grep/git status…）直接放行，不再弹审批。
+  // 判定不了一律回落到人工审批，见 src/bash-policy.js。
+  get autoApproveReadOnlyBash() {
+    return bool('BASH_READONLY_AUTO_APPROVE', true);
   },
 
   // 允许读写的目录白名单。默认只有工作目录本身；
@@ -108,6 +131,7 @@ export function validateConfig() {
   config.botSecret;
   config.workspace;
   config.maxTurns;
+  config.permissionMode;
   config.sessionTtlMs;
   config.approvalTimeoutMs;
 

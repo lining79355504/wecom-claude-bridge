@@ -113,4 +113,26 @@ export function describeScope(allowedRoots) {
   return allowedRoots === '*' ? '不限制' : allowedRoots.join(', ');
 }
 
+/** 所有权限模式都先检查硬性限制；通过时不抢先批准，交给 SDK 判断。 */
+export function createToolGuard(config, onDenied = () => {}) {
+  return async (event) => {
+    const toolName = event.tool_name;
+    const input = event.tool_input;
+    const reason = config.deniedTools.includes(toolName)
+      ? `${toolName} 已被配置禁用`
+      : toolName === 'Bash'
+        ? checkBashScope(input?.command, config.allowedPaths)
+        : checkPathScope(toolName, input, config.allowedPaths, config.workspace);
+    if (!reason) return {};
+    await onDenied(reason);
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: reason,
+      },
+    };
+  };
+}
+
 export { extractPaths, sep };

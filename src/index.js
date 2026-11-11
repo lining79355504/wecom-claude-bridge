@@ -3,7 +3,8 @@ import { hostname } from 'node:os';
 import { config, validateConfig } from './config.js';
 import { ApprovalManager, renderApprovalPrompt } from './approval.js';
 import { ClaudeSession } from './claude.js';
-import { checkBashScope, checkPathScope, describeScope } from './guard.js';
+import { describeScope } from './guard.js';
+import { analyzeBashCommand } from './bash-policy.js';
 
 const log = {
   debug: (...a) => process.env.DEBUG && console.log('[debug]', ...a),
@@ -130,24 +131,20 @@ class ProgressStream {
 // ---------------------------------------------------------------------------
 
 async function handleToolPermission(frame, chatKey, toolName, input, opts) {
-  if (config.deniedTools.includes(toolName)) {
-    return { behavior: 'deny', message: `${toolName} 已被配置禁用` };
-  }
-
-  // 路径围栏：无论工具是否只读，只要越界就拒绝，且不给审批机会
-  const scopeError =
-    toolName === 'Bash'
-      ? checkBashScope(input?.command, config.allowedPaths)
-      : checkPathScope(toolName, input, config.allowedPaths, config.workspace);
-  if (scopeError) {
-    log.warn(`[${chatKey}] 路径越界拦截: ${scopeError}`);
-    await push(frame, `🚫 **已拦截**：${scopeError}\n\n允许的目录：\`${describeScope(config.allowedPaths)}\``);
-    return { behavior: 'deny', message: `${scopeError}（已由路径围栏拦截）` };
-  }
-
-  // 只读工具直接放行
-  if (config.readOnlyTools.includes(toolName)) {
+  // 硬性限制已由 PreToolUse 检查。auto 模式走到这里代表需要人工决定。
+  if (config.permissionMode !== 'auto' && config.readOnlyTools.includes(toolName)) {
     return { behavior: 'allow', updatedInput: input };
+  }
+
+  // 纯只读的 Bash 命令（ls/cat/grep/git status…）同样直接放行；
+  // 判定不了的从严，继续走审批。放在路径围栏之后，越界依然先被拦下。
+  if (config.permissionMode !== 'auto' && toolName === 'Bash' && config.autoApproveReadOnlyBash) {
+    const verdict = analyzeBashCommand(input?.command);
+    if (verdict.readOnly) {
+      log.debug(`[${chatKey}] 只读命令放行: ${input?.command}`);
+      return { behavior: 'allow', updatedInput: input };
+    }
+    log.debug(`[${chatKey}] 需要审批的命令: ${input?.command}｜原因: ${verdict.reason}`);
   }
 
   await push(frame, renderApprovalPrompt(toolName, input, opts?.title));
@@ -288,6 +285,7 @@ async function handleCommand(frame, chatKey, text) {
         [
           '**状态**',
           `- 工作目录：\`${config.workspace}\``,
+          `- 权限模式：\`${config.permissionMode}\``,
           `- 会话：${session.sessionId ? '已有上下文' : '新会话'}`,
           `- 运行中：${session.isBusy() ? '是' : '否'}`,
           `- 待审批：${approvals.hasPending(chatKey) ? '有' : '无'}`,
@@ -306,7 +304,7 @@ async function handleCommand(frame, chatKey, text) {
           '`/status` 查看当前状态',
           '`/help` 显示本帮助',
           '',
-          '直接发消息就是和 Claude 对话。改文件、执行命令前会先发审批给你，回复 `y` / `n`。',
+          `当前权限模式：${config.permissionMode}。需要人工审批时会发提示，回复 \`y\` / \`n\`。`,
         ].join('\n'),
       );
       return;
@@ -322,6 +320,8 @@ function getSession(chatKey) {
     session = new ClaudeSession({
       chatKey,
       logger: log,
+      onDenied: (reason) =>
+        push(session.currentFrame, `🚫 **已拦截**：${reason}\n\n允许的目录：\`${describeScope(config.allowedPaths)}\``),
       canUseTool: (toolName, input, opts) =>
         handleToolPermission(session.currentFrame, chatKey, toolName, input, opts),
       onEvent: () => {},

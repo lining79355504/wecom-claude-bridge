@@ -1,5 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { config } from './config.js';
+import { createToolGuard } from './guard.js';
 
 const SYSTEM_PROMPT_APPEND = `
 ## 你正在通过企业微信远程操控
@@ -18,11 +19,15 @@ const SYSTEM_PROMPT_APPEND = `
  * 用 SDK 的 query() + resume 保持多轮上下文。
  */
 export class ClaudeSession {
-  constructor({ chatKey, canUseTool, onEvent, logger }) {
+  constructor({ chatKey, canUseTool, onEvent, onDenied, logger }) {
     this.chatKey = chatKey;
     this.canUseTool = canUseTool;
     this.onEvent = onEvent;
     this.logger = logger;
+    this.toolGuard = createToolGuard(config, async (reason) => {
+      this.logger.warn(`[${this.chatKey}] 工具拦截: ${reason}`);
+      await onDenied?.(reason);
+    });
 
     /** @type {string|null} 上一轮的 session_id，用于 resume */
     this.sessionId = null;
@@ -58,7 +63,10 @@ export class ClaudeSession {
 
     const options = {
       cwd: config.workspace,
-      permissionMode: 'default',
+      permissionMode: config.permissionMode,
+      hooks: {
+        PreToolUse: [{ hooks: [this.toolGuard], onFailure: 'block' }],
+      },
       maxTurns: config.maxTurns,
       abortController: this.abortController,
       canUseTool: this.canUseTool,

@@ -66,7 +66,7 @@ npm start
 | 消息 | 效果 |
 |---|---|
 | `看一下 scv 里 XxxService 干嘛的` | Claude 读代码并解释 |
-| `给 AdMediaService 加个按 adMediaId 查询的方法` | 会先发审批，`y` 后才改 |
+| `给 AdMediaService 加个按 adMediaId 查询的方法` | 根据权限模式自动判断或请求审批 |
 | `/reset` | 清空上下文开新会话 |
 | `/stop` | 打断当前任务 |
 | `/status` | 看工作目录、会话状态、待审批 |
@@ -74,7 +74,15 @@ npm start
 
 ## 权限模型
 
-「只读优先 + 改文件二次确认」，分三层：
+在 `.env` 中设置 `CLAUDE_PERMISSION_MODE`，重启桥接生效：
+
+- `default`（未配置时的默认值）：只读优先，其余操作人工审批。
+- `acceptEdits`：由 Claude 自动接受文件编辑，其余操作按权限规则判断。
+- `auto`：由 Claude 原生分类器自动批准或拒绝操作，无法决定时仍通过企微请求 `y/n` 审批。可用性取决于模型、账号及组织策略。
+
+目录围栏和 `DENIED_TOOLS` 在所有模式下都通过 `PreToolUse` 钩子先行检查；通过检查不会直接批准操作。钩子失败会阻止执行。`auto` 的人工审批回退不会再被本地只读名单自动放行。
+
+以下三层说明适用于 `default` 模式：
 
 **第一层 · 目录围栏**（自动，无审批机会）
 
@@ -89,6 +97,24 @@ Claude 只能在 `CLAUDE_WORKSPACE`（或 `CLAUDE_ALLOWED_PATHS`）范围内读�
 **第二层 · 只读放行**
 
 `READ_ONLY_TOOLS` 里的工具（Read / Glob / Grep / WebSearch 等）不打扰你，直接执行。
+
+`Bash` 也按命令内容区分：**纯只读命令**（`ls` / `cat` / `grep` / `find` / `git status` / `npm ls` …）直接放行，不弹审批。判定不了的一律回落到第三层审批——宁可多问一次，也不放行没看懂的命令。
+
+```
+✅ 直接执行: ls -la
+✅ 直接执行: grep -rn "foo" src && wc -l src/index.js
+✅ 直接执行: git log --oneline -5
+⏸ 需要审批: rm -rf build          （未识别的命令）
+⏸ 需要审批: cat a.txt > b.txt     （重定向）
+⏸ 需要审批: echo $(whoami)        （命令替换）
+⏸ 需要审批: find . -name "*.js" -delete   （带 -delete）
+```
+
+只读判定有两道硬约束：
+- `>` / `<` / `|` / `;` / `&&` / `$(…)` / 反引号 / `$VAR` 一律不放行——它们能把一条只读命令变成写操作。
+- `find -exec`、`sort -o`、`tail -f`、`git --output`、`git branch <新分支>`、`git config <key> <value>` 这类「看起来只读、实际会写」的参数单独拉黑。
+
+规则在 `src/bash-policy.js`，要恢复「所有 Bash 都审批」就把 `.env` 里的 `BASH_READONLY_AUTO_APPROVE` 设为 `false`。
 
 **第三层 · 逐次审批**
 
@@ -113,6 +139,7 @@ git push origin master --force
 | 想要 | 怎么配 |
 |---|---|
 | 更严格（连读文件也审批） | `READ_ONLY_TOOLS=` （留空） |
+| Bash 一律审批（不做只读识别） | `BASH_READONLY_AUTO_APPROVE=false` |
 | 绝对禁止某工具 | `DENIED_TOOLS=Bash` |
 | 放开到多个仓库 | `CLAUDE_ALLOWED_PATHS=/a,/b` |
 | 完全不限制路径 | `CLAUDE_ALLOWED_PATHS=*`（不推荐） |

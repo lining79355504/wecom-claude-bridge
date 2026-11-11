@@ -29,6 +29,7 @@ try {
   validateConfig();
   ok('配置校验通过');
   ok(`工作目录: ${config.workspace}`);
+  ok(`权限模式: ${config.permissionMode}`);
   ok(`白名单人数: ${config.allowedUserIds.length}`);
   ok(`只读放行工具: ${config.readOnlyTools.length} 个`);
   ok(`目录围栏: ${describeScope(config.allowedPaths)}`);
