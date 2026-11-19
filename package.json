@@ -6,11 +6,12 @@
   "type": "module",
   "main": "src/index.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "start": "node src/index.js",
-    "check": "node scripts/check.js"
+    "check": "node scripts/check.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.318",

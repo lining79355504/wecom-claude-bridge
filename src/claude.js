@@ -1,6 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { config } from './config.js';
 import { createToolGuard } from './guard.js';
+import { claudeFailure, isTurnLimitError } from './claude-errors.js';
 
 const SYSTEM_PROMPT_APPEND = `
 ## 你正在通过企业微信远程操控
@@ -15,22 +16,31 @@ const SYSTEM_PROMPT_APPEND = `
 `;
 
 /**
- * 一次对话会话（对应一个企微聊天）。
+ * 一次对话会话（对应一张工单）。
  * 用 SDK 的 query() + resume 保持多轮上下文。
  */
 export class ClaudeSession {
-  constructor({ chatKey, canUseTool, onEvent, onDenied, logger }) {
+  constructor({ chatKey, canUseTool, onEvent, onDenied, onSessionId, workspace = config.workspace, sessionId = null,
+    maxTurns = config.maxTurns, queryFn = query, logger }) {
     this.chatKey = chatKey;
     this.canUseTool = canUseTool;
     this.onEvent = onEvent;
     this.logger = logger;
-    this.toolGuard = createToolGuard(config, async (reason) => {
+    this.workspace = workspace;
+    this.onSessionId = onSessionId;
+    this.maxTurns = maxTurns;
+    this.query = queryFn;
+    this.toolGuard = createToolGuard({
+      get deniedTools() { return config.deniedTools; },
+      get allowedPaths() { return config.allowedPaths; },
+      workspace,
+    }, async (reason) => {
       this.logger.warn(`[${this.chatKey}] 工具拦截: ${reason}`);
       await onDenied?.(reason);
     });
 
     /** @type {string|null} 上一轮的 session_id，用于 resume */
-    this.sessionId = null;
+    this.sessionId = sessionId;
     this.lastActive = Date.now();
     this.abortController = null;
     /** 当前正在处理的原始帧，审批回调需要它来定位回复目标 */
@@ -48,7 +58,6 @@ export class ClaudeSession {
   abort() {
     if (this.abortController) {
       this.abortController.abort();
-      this.abortController = null;
       return true;
     }
     return false;
@@ -58,16 +67,19 @@ export class ClaudeSession {
    * 跑一轮对话。返回最终文本。
    */
   async run(prompt) {
+    if (this.isBusy()) throw new Error('当前工单仍在执行');
     this.lastActive = Date.now();
+    this.lastRunSucceeded = false;
+    this.lastRunFailure = null;
     this.abortController = new AbortController();
 
     const options = {
-      cwd: config.workspace,
+      cwd: this.workspace,
       permissionMode: config.permissionMode,
       hooks: {
         PreToolUse: [{ hooks: [this.toolGuard], onFailure: 'block' }],
       },
-      maxTurns: config.maxTurns,
+      maxTurns: this.maxTurns,
       abortController: this.abortController,
       canUseTool: this.canUseTool,
       systemPrompt: {
@@ -87,13 +99,14 @@ export class ClaudeSession {
     let resultText = null;
 
     try {
-      for await (const message of query({ prompt, options })) {
+      for await (const message of this.query({ prompt, options })) {
         this.lastActive = Date.now();
 
         switch (message.type) {
           case 'system':
             if (message.subtype === 'init') {
               this.sessionId = message.session_id ?? this.sessionId;
+              this.onSessionId?.(this.sessionId);
               this.logger.info(
                 `[${this.chatKey}] session=${this.sessionId} model=${message.model}`,
               );
@@ -116,18 +129,19 @@ export class ClaudeSession {
           }
 
           case 'result': {
-            if (message.subtype === 'success') {
+            if (message.subtype === 'success' && !message.is_error) {
+              this.lastRunSucceeded = true;
               resultText = message.result ?? finalText;
               this.logger.info(
                 `[${this.chatKey}] 完成 turns=${message.num_turns} cost=$${message.total_cost_usd?.toFixed(4)}`,
               );
             } else {
+              this.lastRunSucceeded = false;
+              this.lastRunFailure = claudeFailure(message, this.maxTurns);
               this.logger.warn(
                 `[${this.chatKey}] 异常结束 subtype=${message.subtype}`,
               );
-              resultText =
-                finalText ||
-                `执行未正常结束（${message.subtype}）。可以换个说法重试，或发 /reset 开新会话。`;
+              resultText = [this.lastRunFailure.message, finalText ? `**中断前的部分输出（非最终结果）**\n${finalText}` : ''].filter(Boolean).join('\n\n');
             }
             break;
           }
@@ -136,6 +150,11 @@ export class ClaudeSession {
             break;
         }
       }
+    } catch (error) {
+      this.lastRunSucceeded = false;
+      this.lastRunFailure = claudeFailure(error, this.maxTurns);
+      if (!isTurnLimitError(error)) throw error;
+      resultText = [this.lastRunFailure.message, finalText ? `**中断前的部分输出（非最终结果）**\n${finalText}` : ''].filter(Boolean).join('\n\n');
     } finally {
       this.abortController = null;
       this.lastActive = Date.now();

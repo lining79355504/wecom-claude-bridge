@@ -30,6 +30,9 @@ try {
   ok('配置校验通过');
   ok(`工作目录: ${config.workspace}`);
   ok(`权限模式: ${config.permissionMode}`);
+  ok(`工单数据库: ${config.ticketDbPath}`);
+  ok(`定时任务并发: ${config.scheduleConcurrency}；推送并发: ${config.scheduleDeliveryConcurrency}；时区: ${config.scheduleTimezone}`);
+  ok(`单次轮数上限: 工单 ${config.maxTurns}，定时任务 ${config.scheduleMaxTurns}`);
   ok(`白名单人数: ${config.allowedUserIds.length}`);
   ok(`只读放行工具: ${config.readOnlyTools.length} 个`);
   ok(`目录围栏: ${describeScope(config.allowedPaths)}`);
@@ -56,6 +59,7 @@ for (const dep of [
   '@wecom/aibot-node-sdk',
   '@anthropic-ai/claude-agent-sdk',
   'dotenv',
+  'node:sqlite',
 ]) {
   try {
     await import(dep);

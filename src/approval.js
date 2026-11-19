@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
 /**
- * 审批队列：Claude 想执行危险操作时挂起，等用户在企微里回 y/n。
+ * 审批队列：需要人工判断时挂起，工单模式要求回复 y/n 加完整审批编号。
  *
- * 同一时间一个会话只允许一个待审批请求——Claude 本身是串行执行工具的，
- * 多个待审批只会让人分不清在回哪一条。
+ * 每个聊天只保留一条待审批请求。调用方在出现并发工具请求时拒绝新的请求，
+ * 防止多个操作争用同一个审批入口。
  */
 export class ApprovalManager {
   /**
@@ -21,13 +21,13 @@ export class ApprovalManager {
 
   /**
    * 创建一条待审批请求，返回一个 promise，用户回复后 resolve。
-   * @returns {{ id: string, promise: Promise<boolean> }}
+   * @returns {{ id: string, promise: Promise<{allowed: boolean, reason: string}> }}
    */
-  request({ chatKey, title, detail }) {
+  request({ chatKey, title, detail, ticketId }) {
     // 同一会话已有待审批：先拒绝旧的，避免队列堆积
     this.cancel(chatKey, '被新的审批请求取代');
 
-    const id = randomUUID().slice(0, 8);
+    const id = `${ticketId ? `${ticketId}-` : ''}${randomUUID().slice(0, 8)}`;
     let resolveFn;
     const promise = new Promise((resolve) => {
       resolveFn = resolve;
@@ -41,6 +41,7 @@ export class ApprovalManager {
 
     this.pending.set(chatKey, {
       id,
+      ticketId,
       title,
       detail,
       resolve: resolveFn,
@@ -67,7 +68,8 @@ export class ApprovalManager {
     const pending = this.pending.get(chatKey);
     if (!pending) return null;
 
-    const answer = text.trim().toLowerCase();
+    const [answer, id, ...extra] = text.trim().toLowerCase().split(/\s+/);
+    if (pending.ticketId && (id !== pending.id || extra.length)) return 'unrecognized';
     if (['y', 'yes', '是', '好', '同意', '可以', 'ok', '1'].includes(answer)) {
       this.settle(chatKey, pending.id, true, '用户同意');
       return 'approved';
@@ -95,9 +97,10 @@ export class ApprovalManager {
 }
 
 /** 把工具调用渲染成企微里能看懂的一段文字 */
-export function renderApprovalPrompt(toolName, input, title) {
+export function renderApprovalPrompt(toolName, input, title, { id, ticketId, timeoutMs = 300000 } = {}) {
   const lines = [];
   lines.push(`**Claude 请求执行操作**`);
+  if (ticketId) lines.push(`工单 #${ticketId}`);
   if (title) lines.push(title);
   lines.push('');
   lines.push(`\`${toolName}\``);
@@ -111,7 +114,8 @@ export function renderApprovalPrompt(toolName, input, title) {
   }
 
   lines.push('');
-  lines.push('回复 `y` 同意，`n` 拒绝（5 分钟无响应自动拒绝）。');
+  const suffix = id ? ` ${id}` : '';
+  lines.push(`回复 \`y${suffix}\` 同意，\`n${suffix}\` 拒绝（${Math.ceil(timeoutMs / 1000)} 秒无响应自动拒绝）。`);
   return lines.join('\n');
 }
 

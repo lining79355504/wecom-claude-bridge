@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /**
  * 配置按需校验：字段第一次被读取时才检查，这样单个模块可以脱离完整 .env
@@ -39,6 +40,12 @@ function num(name, fallback) {
     throw new Error(`配置 ${name} 必须是正数，当前值: ${raw}`);
   }
   return parsed;
+}
+
+function integer(name, fallback, max) {
+  const value = num(name, fallback);
+  if (!Number.isSafeInteger(value) || value > max) throw new Error(`配置 ${name} 必须是 1 至 ${max} 的整数`);
+  return value;
 }
 
 const READ_ONLY_DEFAULT = [
@@ -86,7 +93,24 @@ export const config = {
     return mode;
   },
 
-  // 单个会话空闲多久后丢弃上下文（毫秒），默认 30 分钟
+  get ticketDbPath() {
+    return process.env.TICKET_DB_PATH?.trim()
+      ? resolve(process.env.TICKET_DB_PATH.trim())
+      : fileURLToPath(new URL('../data/tickets.sqlite', import.meta.url));
+  },
+
+  get scheduleConcurrency() { return integer('SCHEDULE_CONCURRENCY', 4, 32); },
+  get scheduleMaxTurns() { return integer('SCHEDULE_MAX_TURNS', 100, 1000); },
+  get scheduleDeliveryConcurrency() { return integer('SCHEDULE_DELIVERY_CONCURRENCY', 4, 32); },
+  get scheduleTimeoutMs() { return integer('SCHEDULE_TIMEOUT_MS', 30 * 60 * 1000, 2147483647); },
+  get scheduleTimezone() {
+    const timezone = process.env.SCHEDULE_TIMEZONE?.trim() || 'Asia/Shanghai';
+    try { new Intl.DateTimeFormat('en', { timeZone: timezone }); }
+    catch { throw new Error('SCHEDULE_TIMEZONE 必须是有效的 IANA 时区，例如 Asia/Shanghai'); }
+    return timezone;
+  },
+
+  // 空闲会话仅回收内存对象；工单 sessionId 仍保存在数据库中
   get sessionTtlMs() {
     return num('SESSION_TTL_MS', 30 * 60 * 1000);
   },
@@ -134,6 +158,11 @@ export function validateConfig() {
   config.permissionMode;
   config.sessionTtlMs;
   config.approvalTimeoutMs;
+  config.scheduleConcurrency;
+  config.scheduleMaxTurns;
+  config.scheduleDeliveryConcurrency;
+  config.scheduleTimeoutMs;
+  config.scheduleTimezone;
 
   if (config.allowedUserIds.length === 0) {
     throw new Error(

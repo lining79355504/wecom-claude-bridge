@@ -4,3 +4,7 @@ node_modules/
 .DS_Store
 .idea/
 nohup.out
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
