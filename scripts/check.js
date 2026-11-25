@@ -59,6 +59,7 @@ for (const dep of [
   '@wecom/aibot-node-sdk',
   '@anthropic-ai/claude-agent-sdk',
   'dotenv',
+  'zod',
   'node:sqlite',
 ]) {
   try {

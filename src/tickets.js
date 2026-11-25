@@ -36,6 +36,11 @@ export class TicketStore {
         message_id INTEGER NOT NULL REFERENCES messages(id), state TEXT NOT NULL DEFAULT 'queued',
         recovered INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS message_images (
+        message_id INTEGER NOT NULL REFERENCES messages(id),
+        position INTEGER NOT NULL, data BLOB NOT NULL,
+        PRIMARY KEY (message_id, position)
+      );
     `);
     // 不自动重放重启前的操作。用户 /resume 后才恢复，旧审批一律失效。
     this.transaction(() => {
@@ -114,13 +119,20 @@ export class TicketStore {
       .get(id)?.content;
   }
 
-  enqueue(id, content) {
+  enqueue(id, content, images = []) {
     return this.transaction(() => {
       const messageId = this.addMessage(id, 'user', content);
+      const insertImage = this.db.prepare('INSERT INTO message_images (message_id, position, data) VALUES (?, ?, ?)');
+      images.forEach((image, index) => insertImage.run(messageId, index, image.buffer));
       const jobId = Number(this.db.prepare('INSERT INTO jobs (ticket_id, message_id) VALUES (?, ?)').run(id, messageId).lastInsertRowid);
       if (!['running', 'approval'].includes(this.get(id).status)) this.setStatus(id, 'queued');
       return jobId;
     });
+  }
+
+  images(messageId) {
+    return this.db.prepare('SELECT data FROM message_images WHERE message_id = ? ORDER BY position').all(messageId)
+      .map((row) => ({ buffer: Buffer.from(row.data) }));
   }
 
   nextJob() {

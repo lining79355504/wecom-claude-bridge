@@ -1,4 +1,5 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import { config } from './config.js';
 import { createToolGuard } from './guard.js';
 import { claudeFailure, isTurnLimitError } from './claude-errors.js';
@@ -15,13 +16,41 @@ const SYSTEM_PROMPT_APPEND = `
 5. 用户看不到你的文件读写过程，重要改动要复述改了什么文件。
 `;
 
+const IMAGE_INSTRUCTIONS = `
+6. 用户可以发送图片。图片内容直接附在输入中，同时提供本地副本路径，方便使用现有工具裁剪、标注或转换格式。不要修改收到的原图副本，处理结果另存文件。
+7. 用户要求发送图片或截图时，先生成或找到实际图片文件，再调用 mcp__wecom_images__send_image。仅支持 PNG/JPEG，最大 2 MiB；必要时先缩小或压缩。工具成功才表示已发送，不要用本地 Markdown 图片路径冒充发送成功。
+8. 截图、图像编辑依赖本机已有工具及系统授权，仍遵守工具审批和目录限制。没有可用的截图或编辑工具时明确说明。
+`;
+
+export function imageSenderTool(sendImage, getSignal) {
+  return tool('send_image', '把本地 PNG/JPEG 图片发送到本工单的当前企业微信聊天，最大 2 MiB。仅在用户要求发图时调用。',
+    { file_path: z.string().min(1).describe('图片文件路径，相对路径以工单工作目录为准') },
+    async ({ file_path }) => {
+      try {
+        const result = await sendImage(file_path, { signal: getSignal() });
+        return { content: [{ type: 'text', text: result }] };
+      } catch (error) {
+        return { isError: true, content: [{ type: 'text', text: error.message }] };
+      }
+    }, { alwaysLoad: true });
+}
+
+async function* userMessage(text, images, sessionId) {
+  const content = [{ type: 'text', text }];
+  for (const [index, image] of images.entries()) {
+    content.push({ type: 'text', text: `图片 ${index + 1}（本地副本：${image.path}）` });
+    content.push({ type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.buffer.toString('base64') } });
+  }
+  yield { type: 'user', session_id: sessionId ?? '', parent_tool_use_id: null, message: { role: 'user', content } };
+}
+
 /**
  * 一次对话会话（对应一张工单）。
  * 用 SDK 的 query() + resume 保持多轮上下文。
  */
 export class ClaudeSession {
   constructor({ chatKey, canUseTool, onEvent, onDenied, onSessionId, workspace = config.workspace, sessionId = null,
-    maxTurns = config.maxTurns, queryFn = query, logger }) {
+    maxTurns = config.maxTurns, queryFn = query, logger, sendImage }) {
     this.chatKey = chatKey;
     this.canUseTool = canUseTool;
     this.onEvent = onEvent;
@@ -30,6 +59,7 @@ export class ClaudeSession {
     this.onSessionId = onSessionId;
     this.maxTurns = maxTurns;
     this.query = queryFn;
+    this.sendImage = sendImage;
     this.toolGuard = createToolGuard({
       get deniedTools() { return config.deniedTools; },
       get allowedPaths() { return config.allowedPaths; },
@@ -66,7 +96,7 @@ export class ClaudeSession {
   /**
    * 跑一轮对话。返回最终文本。
    */
-  async run(prompt) {
+  async run(prompt, images = []) {
     if (this.isBusy()) throw new Error('当前工单仍在执行');
     this.lastActive = Date.now();
     this.lastRunSucceeded = false;
@@ -85,7 +115,7 @@ export class ClaudeSession {
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
-        append: SYSTEM_PROMPT_APPEND,
+        append: SYSTEM_PROMPT_APPEND + (this.sendImage ? IMAGE_INSTRUCTIONS : ''),
       },
       // 让 SDK 输出完整助手消息（含 tool_use / tool_result），用于进度提示
       includePartialMessages: false,
@@ -94,12 +124,18 @@ export class ClaudeSession {
     if (this.sessionId) {
       options.resume = this.sessionId;
     }
+    if (this.sendImage) {
+      options.mcpServers = { wecom_images: createSdkMcpServer({
+        name: 'wecom_images', tools: [imageSenderTool(this.sendImage, () => this.abortController?.signal)],
+      }) };
+    }
 
     let finalText = '';
     let resultText = null;
 
     try {
-      for await (const message of this.query({ prompt, options })) {
+      const input = images.length || this.sendImage ? userMessage(prompt, images, this.sessionId) : prompt;
+      for await (const message of this.query({ prompt: input, options })) {
         this.lastActive = Date.now();
 
         switch (message.type) {

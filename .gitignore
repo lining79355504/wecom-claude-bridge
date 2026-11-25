@@ -5,6 +5,7 @@ node_modules/
 .idea/
 nohup.out
 data/
+.wecom-bridge-media/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

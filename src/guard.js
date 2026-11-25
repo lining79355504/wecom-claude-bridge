@@ -29,6 +29,7 @@ function extractPaths(toolName, input) {
     case 'MultiEdit':
     case 'NotebookRead':
     case 'NotebookEdit':
+    case 'mcp__wecom_images__send_image':
       push(input.file_path);
       push(input.path);
       push(input.notebook_path);

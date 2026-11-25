@@ -7,6 +7,8 @@ import { TicketBot } from './ticket-bot.js';
 import { ScheduleStore } from './schedule-store.js';
 import { Scheduler } from './scheduler.js';
 import { redactSecrets } from './schedule-delivery.js';
+import { ImageService } from './images.js';
+import { createMessageHandler } from './incoming.js';
 
 const safeLog = (args) => args.map((value) => typeof value === 'string' ? redactSecrets(value)
   : value instanceof Error ? redactSecrets(value.stack || value.message) : value);
@@ -41,16 +43,12 @@ const bot = new TicketBot({
   createProgress: (frame, ticket) => new ProgressStream(frame, ticket.id),
   createSession: (options) => new ClaudeSession(options),
   scheduler,
+  imageService: new ImageService({ client: wsClient, allowedPaths: config.allowedPaths }),
 });
 
 // ---------------------------------------------------------------------------
 // 会话键与目标
 // ---------------------------------------------------------------------------
-
-function chatKeyOf(frame) {
-  const body = frame?.body ?? {};
-  return body.chattype === 'group' ? `group:${body.chatid}` : `user:${body.from?.userid}`;
-}
 
 /**
  * 主动推送的目标：单聊填 userid，群聊填 chatid。
@@ -137,19 +135,8 @@ class ProgressStream {
   }
 }
 
-// 工单路由之前统一验证白名单，包含命令和审批回复。
-async function handleUserText(frame) {
-  const body = frame.body ?? {};
-  const userId = body.from?.userid;
-  const text = (body.text?.content ?? '').trim();
-  if (!config.allowedUserIds.includes(userId)) {
-    log.warn(`拒绝非白名单用户: ${userId}`);
-    await push(frame, '⛔ 你不在这个机器人的白名单里，无法使用。');
-    return;
-  }
-  if (!text) return;
-  await bot.handle({ chatKey: chatKeyOf(frame), userId, text, frame });
-}
+// 白名单校验覆盖所有输入，图片下载发生在鉴权之后。
+const dispatch = createMessageHandler({ config, bot, send: push, logger: log });
 
 // ---------------------------------------------------------------------------
 // 事件绑定
@@ -168,28 +155,11 @@ wsClient.on('disconnected', (reason) => {
 wsClient.on('reconnecting', (attempt) => log.warn(`第 ${attempt} 次重连…`));
 wsClient.on('error', (err) => log.error('连接错误', err?.message ?? err));
 
-/** 事件入口 */
-async function dispatch(frame) {
-  await handleUserText(frame);
+for (const type of ['text', 'voice', 'image', 'mixed']) {
+  wsClient.on(`message.${type}`, (frame) => {
+    dispatch(frame).catch(() => log.error('处理消息异常'));
+  });
 }
-
-wsClient.on('message.text', (frame) => {
-  dispatch(frame).catch((err) => log.error('处理消息异常', err));
-});
-
-wsClient.on('message.voice', async (frame) => {
-  const body = frame?.body ?? {};
-  const converted = body.voice?.content ?? body.voice?.text ?? '';
-  if (!converted) {
-    await push(frame, '暂时只支持文字消息，语音转写结果为空。');
-    return;
-  }
-  const synthetic = {
-    ...frame,
-    body: { ...body, text: { content: converted }, msgtype: 'text' },
-  };
-  await dispatch(synthetic).catch((err) => log.error('处理语音异常', err));
-});
 
 wsClient.on('event.enter_chat', async (frame) => {
   try {

@@ -8,8 +8,8 @@ const label = (ticket) => `#${ticket.id} ${ticket.title}`;
 
 /** 消息路由和串行执行器，传输层与 Claude SDK 可替换，便于离线测试。 */
 export class TicketBot {
-  constructor({ store, config, send, createProgress, createSession, logger, scheduler }) {
-    Object.assign(this, { store, config, send, createProgress, createSession, logger, scheduler });
+  constructor({ store, config, send, createProgress, createSession, logger, scheduler, imageService }) {
+    Object.assign(this, { store, config, send, createProgress, createSession, logger, scheduler, imageService });
     this.approvals = new ApprovalManager({ logger, timeoutMs: config.approvalTimeoutMs });
     this.sessions = new Map();
     this.frames = new Map();
@@ -18,11 +18,11 @@ export class TicketBot {
     this.shuttingDown = false;
   }
 
-  async handle({ chatKey, userId, text, frame }) {
+  async handle({ chatKey, userId, text, frame, images = [] }) {
     try {
       if (this.shuttingDown) return;
-      if (text.startsWith('/')) return await this.command(chatKey, userId, text, frame);
-      if (approvalReply.test(text)) {
+      if (text.startsWith('/')) return await this.command(chatKey, userId, text, frame, images);
+      if (!images.length && approvalReply.test(text)) {
         const result = this.approvals.settleByReply(chatKey, text);
         const pending = this.approvals.getPending(chatKey);
         await this.send(frame, result === 'approved' ? '✅ 已同意，继续执行。'
@@ -35,7 +35,7 @@ export class TicketBot {
       if (!ticket || ticket.status === 'closed') {
         ticket = this.store.create(chatKey, userId, text, this.config.workspace);
       }
-      await this.submit(ticket, text, frame);
+      await this.submit(ticket, text, frame, images);
     } catch (error) {
       this.logger.error('工单消息处理失败', error);
       await this.send(frame, `❌ ${error.message}`);
@@ -52,7 +52,8 @@ export class TicketBot {
     return current;
   }
 
-  async command(chatKey, userId, text, frame) {
+  async command(chatKey, userId, text, frame, images = []) {
+    if (images.length && !/^\/new(?:\s|$)/.test(text)) throw new Error('带图片的命令仅支持 /new 需求；也可以直接发送图片或图文作为当前工单补充。');
     if (/^\/schedule(?:\s|$)/.test(text)) {
       if (!this.scheduler) throw new Error('定时服务尚未启用。');
       return this.scheduler.handle({ chatKey, userId, text: text.slice('/schedule'.length), frame, reply: this.send });
@@ -60,9 +61,10 @@ export class TicketBot {
     const [command, ...parts] = text.slice(1).split(/\s+/);
     const arg = parts.join(' ').trim();
     if (command === 'new') {
-      if (!arg) throw new Error('用法：/new 需求描述');
-      const ticket = this.store.create(chatKey, userId, arg, this.config.workspace);
-      return this.submit(ticket, arg, frame);
+      if (!arg && !images.length) throw new Error('用法：/new 需求描述');
+      const request = arg || '请分析收到的图片。';
+      const ticket = this.store.create(chatKey, userId, request, this.config.workspace);
+      return this.submit(ticket, request, frame, images);
     }
     if (command === 'list') {
       const current = this.store.current(chatKey);
@@ -86,6 +88,7 @@ export class TicketBot {
         '`/schedule help` 定时执行 Claude 任务，推送到当前聊天或群 Webhook',
         '',
         '普通消息归入当前工单；忙时补充需求会排队。所有工单串行执行。',
+        '支持图片和图文（每条最多 4 张，单张 5 MiB）；可要求识图、修改图片或把本地 PNG/JPEG 发回聊天（单张 2 MiB）。',
         `权限模式：${this.config.permissionMode}。审批请回复提示中的完整编号。`,
       ].join('\n'));
     }
@@ -162,16 +165,17 @@ export class TicketBot {
     }
   }
 
-  async submit(ticket, text, frame) {
+  async submit(ticket, text, frame, images = []) {
+    if (images.length) text += `\n\n[附带 ${images.length} 张图片]`;
     if (this.store.pending(ticket.id).some((j) => j.state === 'paused')) {
       // 保持先后顺序：重启前的消息未经 /resume，不允许新消息越过它们执行。
-      const jobId = this.store.enqueue(ticket.id, text);
+      const jobId = this.store.enqueue(ticket.id, text, images);
       this.store.jobState(jobId, 'paused');
       this.store.setStatus(ticket.id, 'stopped');
       await this.send(frame, `工单 #${ticket.id} 的补充已保存。该工单在重启后暂停，请 /resume ${ticket.id} 继续。`);
       return;
     }
-    const jobId = this.store.enqueue(ticket.id, text);
+    const jobId = this.store.enqueue(ticket.id, text, images);
     this.frames.set(jobId, frame);
     await this.send(frame, `📋 **${label(ticket)}**\n需求已保存，${this.draining ? '已排队，当前操作结束后处理' : '准备执行'}。`);
     this.kick();
@@ -226,7 +230,11 @@ export class TicketBot {
         const preface = session.sessionId ? '' : `当前工单：${label(ticket)}\n`
           + (initial && initial !== job.content ? `最初需求：${initial}\n` : '') + '\n';
         const recovery = job.recovered ? '上次执行被中断。先核查已完成的工作，避免重复执行操作。\n\n' : '';
-        const answer = await session.run(preface + recovery + job.content);
+        const storedImages = this.store.images(job.message_id);
+        if (storedImages.length && !this.imageService) throw new Error('图片处理服务尚未启用。');
+        const images = storedImages.length ? await this.imageService.prepareInput(ticket, storedImages) : [];
+        if (active.cancelled || this.shuttingDown) throw new Error('任务已中止');
+        const answer = await session.run(preface + recovery + job.content, images);
         if (active.cancelled || this.shuttingDown) throw new Error('任务已中止');
         this.store.addMessage(ticket.id, 'assistant', answer || '（没有输出）');
         this.store.jobState(job.id, session.lastRunSucceeded === false ? 'failed' : 'done');
@@ -268,6 +276,10 @@ export class TicketBot {
         onSessionId: (id) => this.store.setSession(ticket.id, id),
         onDenied: (reason) => this.send(session.currentFrame, `🚫 工单 #${ticket.id} 已拦截：${reason}`),
         canUseTool: (name, input, opts) => this.permission(ticket, session.currentFrame, name, input, opts),
+        sendImage: this.imageService ? (path, options) => {
+          if (this.active?.session !== session || this.active.cancelled || this.shuttingDown) throw new Error('工单已停止，不能发送图片。');
+          return this.imageService.sendImage(session.currentFrame, ticket, path, options);
+        } : undefined,
         logger: this.logger,
       });
       this.sessions.set(ticket.id, session);
