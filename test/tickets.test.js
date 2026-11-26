@@ -16,6 +16,7 @@ function harness(t, run = async () => '已处理', store = new TicketStore(':mem
   const sent = [];
   const calls = [];
   const sessions = [];
+  const progress = [];
   const bot = new TicketBot({
     store,
     config: {
@@ -25,7 +26,7 @@ function harness(t, run = async () => '已处理', store = new TicketStore(':mem
     logger: { error() {}, warn() {} },
     send: async (frame, text) => { sent.push({ frame, text }); },
     createProgress: (frame) => ({
-      push: async () => {}, finish: async (text) => { sent.push({ frame, text }); },
+      push: async (text, options) => { progress.push({ frame, text, options }); }, finish: async (text) => { sent.push({ frame, text }); },
     }),
     createSession: (options) => {
       const session = {
@@ -51,8 +52,89 @@ function harness(t, run = async () => '已处理', store = new TicketStore(':mem
     await bot.drainPromise;
     store.close();
   });
-  return { bot, store, send, sent, calls, sessions };
+  return { bot, store, send, sent, calls, sessions, progress };
 }
+
+test('/verbose 支持多空格、查询和关闭，按聊天隔离且不创建工单', async (t) => {
+  const h = harness(t);
+  await h.send('/verbose');
+  assert.match(h.sent.at(-1).text, /已关闭/);
+  await h.send('/verbose  on');
+  assert.equal(h.store.verbose('user:a'), true);
+  assert.equal(h.store.verbose('user:b'), false);
+  assert.equal(h.store.current('user:a'), undefined);
+  await h.send('/verbose invalid');
+  assert.match(h.sent.at(-1).text, /用法/);
+  assert.equal(h.store.verbose('user:a'), true);
+  await h.send('/verbose off extra');
+  assert.match(h.sent.at(-1).text, /用法/);
+  await h.send('/verbose off');
+  assert.equal(h.store.verbose('user:a'), false);
+  await h.send('/verbose ON', 'group:g');
+  assert.equal(h.store.verbose('group:g'), true);
+  assert.equal(h.store.verbose('user:a'), false);
+  assert.equal(h.calls.length, 0);
+});
+
+test('verbose 开关即时影响正在执行的工单，关闭后不再转发说明', async (t) => {
+  const gate = deferred();
+  const h = harness(t, async (_prompt, session) => {
+    session.onEvent({ kind: 'assistant_text', text: '默认隐藏的说明' });
+    await gate.promise;
+    return '完成';
+  });
+  t.after(() => gate.resolve());
+  await h.send('/new 任务');
+  const emit = (event) => h.sessions[0].onEvent(event);
+  assert.ok(!h.progress.some((p) => p.text.includes('默认隐藏')));
+  await h.send('/verbose  on');
+  emit({ kind: 'assistant_text', text: '现在开始检查接口。' });
+  emit({ kind: 'tool_result', text: '测试结果：全部通过' });
+  emit({ kind: 'tool_use', toolName: 'Bash', input: { command: 'npm test' } });
+  emit({ kind: 'thinking', text: '不能显示的内部内容' });
+  await h.send('/status');
+  assert.match(h.sent.at(-1).text, /详细进度：on/);
+  await h.send('/verbose off', 'user:b');
+  emit({ kind: 'assistant_text', text: '另一个聊天不影响本聊天。' });
+  await h.send('/verbose off');
+  emit({ kind: 'assistant_text', text: '关闭后隐藏' });
+  assert.ok(h.progress.some((p) => p.text.includes('现在开始检查')));
+  assert.equal(h.progress.find((p) => p.text.includes('现在开始检查')).options.collapsed, true);
+  assert.equal(h.progress.find((p) => p.text.includes('测试结果：全部通过')).options.collapsed, true);
+  assert.ok(h.progress.some((p) => p.text.includes('Bash: npm test')));
+  assert.ok(h.progress.some((p) => p.text.includes('另一个聊天不影响')));
+  assert.ok(!h.progress.some((p) => /内部内容|关闭后隐藏/.test(p.text)));
+  gate.resolve();
+  await h.bot.drainPromise;
+});
+
+test('verbose 立即执行时不发额外保存回执，最终结果仍正常返回', async (t) => {
+  const h = harness(t);
+  await h.send('/verbose on');
+  h.sent.length = 0;
+  await h.send('/new 检查任务');
+  await h.bot.drainPromise;
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].text, /已处理/);
+  assert.doesNotMatch(h.sent[0].text, /需求已保存/);
+});
+
+test('verbose 设置兼容旧库升级并在重启后保留', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'wecom-verbose-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'tickets.sqlite');
+  let store = new TicketStore(path);
+  store.db.exec('DROP TABLE chat_settings');
+  store.close();
+  store = new TicketStore(path);
+  assert.equal(store.verbose('user:a'), false);
+  store.setVerbose('user:a', true);
+  store.close();
+  store = new TicketStore(path);
+  assert.equal(store.verbose('user:a'), true);
+  assert.equal(store.verbose('user:b'), false);
+  store.close();
+});
 
 test('工单各自保存上下文，切换与内存回收后仍恢复原会话', async (t) => {
   const h = harness(t);

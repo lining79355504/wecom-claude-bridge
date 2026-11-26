@@ -1,8 +1,7 @@
 import { decryptFile } from '@wecom/aibot-node-sdk';
-import { constants } from 'node:fs';
-import { mkdir, mkdtemp, open, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import { isInside } from './guard.js';
+import { MediaService } from './media.js';
 
 export const MAX_INPUT_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_OUTPUT_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -49,20 +48,7 @@ export async function downloadImage(image, { fetchImpl = fetch } = {}) {
   }
 }
 
-export class ImageService {
-  constructor({ client, allowedPaths }) {
-    Object.assign(this, { client, allowedPaths });
-  }
-
-  async checkedPath(path) {
-    const canonical = await realpath(path);
-    if (this.allowedPaths !== '*') {
-      const roots = await Promise.all(this.allowedPaths.map((root) => realpath(root).catch(() => resolve(root))));
-      if (!isInside(canonical, roots)) throw new Error('图片路径或符号链接指向允许目录之外。');
-    }
-    return canonical;
-  }
-
+export class ImageService extends MediaService {
   /** SQLite 保存原图；每次执行为本地编辑工具提供独立副本。 */
   async prepareInput(ticket, images) {
     if (!images.length) return [];
@@ -84,35 +70,11 @@ export class ImageService {
 
   async sendImage(frame, ticket, filePath, { signal } = {}) {
     signal?.throwIfAborted();
-    const target = frame?.body?.chattype === 'group' ? frame.body.chatid : frame?.body?.from?.userid;
-    if (!target) throw new Error('当前没有可回复的聊天。');
-    const path = await this.checkedPath(resolve(ticket.workspace, filePath));
-    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    let buffer;
-    try {
-      const stat = await handle.stat();
-      if (!stat.isFile()) throw new Error('只能发送普通图片文件。');
-      if (stat.size > MAX_OUTPUT_IMAGE_BYTES) throw new Error('发送图片不能超过 2 MiB，请先压缩或缩小尺寸。');
-      // 限制实际读取量，防止文件在 stat 后增长。
-      const data = Buffer.alloc(MAX_OUTPUT_IMAGE_BYTES + 1);
-      let size = 0;
-      while (size < data.length) {
-        const { bytesRead } = await handle.read(data, size, data.length - size, null);
-        if (!bytesRead) break;
-        size += bytesRead;
-      }
-      buffer = data.subarray(0, size);
-    } finally { await handle.close(); }
+    const target = this.targetOf(frame);
+    const { buffer, path } = await this.readLocalFile(ticket.workspace, filePath, MAX_OUTPUT_IMAGE_BYTES, '图片', signal);
     const { mediaType, extension } = inspectImage(buffer, MAX_OUTPUT_IMAGE_BYTES);
     if (!['image/png', 'image/jpeg'].includes(mediaType)) throw new Error('发送图片仅支持 PNG、JPEG，请先转换格式。');
-    signal?.throwIfAborted();
-    let uploaded;
-    try { uploaded = await this.client.uploadMedia(buffer, { type: 'image', filename: `image.${extension}` }); }
-    catch { throw new Error('图片上传失败，请检查企微连接后重试。'); }
-    if (!uploaded?.media_id) throw new Error('图片上传未返回素材标识。');
-    signal?.throwIfAborted();
-    try { await this.client.sendMessage(target, { msgtype: 'image', image: { media_id: uploaded.media_id } }); }
-    catch { throw new Error('图片发送失败，尚未确认送达，请检查企微连接。'); }
+    await this.uploadAndSend(target, buffer, { type: 'image', filename: `image.${extension}`, label: '图片', signal });
     return `已发送图片：${basename(path)}`;
   }
 }

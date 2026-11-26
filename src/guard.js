@@ -30,6 +30,7 @@ function extractPaths(toolName, input) {
     case 'NotebookRead':
     case 'NotebookEdit':
     case 'mcp__wecom_images__send_image':
+    case 'mcp__wecom_files__send_file':
       push(input.file_path);
       push(input.path);
       push(input.notebook_path);

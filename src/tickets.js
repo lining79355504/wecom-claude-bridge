@@ -26,6 +26,9 @@ export class TicketStore {
       CREATE TABLE IF NOT EXISTS selections (
         chat_key TEXT PRIMARY KEY, ticket_id INTEGER REFERENCES tickets(id)
       );
+      CREATE TABLE IF NOT EXISTS chat_settings (
+        chat_key TEXT PRIMARY KEY, verbose INTEGER NOT NULL DEFAULT 0 CHECK (verbose IN (0, 1))
+      );
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL REFERENCES tickets(id),
         role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -83,6 +86,15 @@ export class TicketStore {
   current(chatKey) {
     return this.db.prepare(`SELECT t.* FROM selections s JOIN tickets t ON t.id = s.ticket_id
       WHERE s.chat_key = ? AND t.chat_key = ?`).get(chatKey, chatKey);
+  }
+
+  verbose(chatKey) {
+    return this.db.prepare('SELECT verbose FROM chat_settings WHERE chat_key = ?').get(chatKey)?.verbose === 1;
+  }
+
+  setVerbose(chatKey, enabled) {
+    this.db.prepare(`INSERT INTO chat_settings (chat_key, verbose) VALUES (?, ?)
+      ON CONFLICT(chat_key) DO UPDATE SET verbose = excluded.verbose`).run(chatKey, enabled ? 1 : 0);
   }
 
   select(chatKey, id) {

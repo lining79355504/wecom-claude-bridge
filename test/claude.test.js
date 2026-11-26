@@ -9,6 +9,31 @@ const sessionWith = (queryFn, extra = {}) => new ClaudeSession({
   chatKey: 'test', workspace: process.cwd(), logger, maxTurns: 100, queryFn, ...extra,
 });
 
+test('进度转发公开文本、工具调用和工具文本结果，不转发 thinking', async () => {
+  const events = [];
+  const session = sessionWith(async function* () {
+    yield { type: 'assistant', message: { content: [
+      { type: 'thinking', thinking: 'private-reasoning', signature: 'private-signature' },
+      { type: 'redacted_thinking', data: 'private-data' },
+      { type: 'text', text: '先检查入口文件，再运行测试。' },
+      { type: 'tool_use', name: 'Read', input: { file_path: 'src/index.js' } },
+    ] } };
+    yield { type: 'user', message: { content: [{ type: 'tool_result', content: 'raw-tool-output' }] } };
+    yield { type: 'user', message: { content: [{ type: 'tool_result', is_error: true, content: [
+      { type: 'text', text: 'test failed' }, { type: 'image', source: { data: 'binary' } },
+    ] }] } };
+    yield { type: 'user', isReplay: true, message: { content: [{ type: 'tool_result', content: 'old-output' }] } };
+    yield { type: 'result', subtype: 'success', result: '已完成' };
+  }, { onEvent: (event) => events.push(event) });
+  assert.equal(await session.run('任务'), '已完成');
+  assert.deepEqual(events, [
+    { kind: 'assistant_text', text: '先检查入口文件，再运行测试。' },
+    { kind: 'tool_use', toolName: 'Read', input: { file_path: 'src/index.js' } },
+    { kind: 'tool_result', text: 'raw-tool-output', isError: false },
+    { kind: 'tool_result', text: 'test failed', isError: true },
+  ]);
+});
+
 test('会话向 SDK 传入指定轮数，普通会话仍使用工单配置', async () => {
   let actual;
   const queryFn = async function* ({ options }) {

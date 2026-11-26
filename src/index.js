@@ -8,7 +8,10 @@ import { ScheduleStore } from './schedule-store.js';
 import { Scheduler } from './scheduler.js';
 import { redactSecrets } from './schedule-delivery.js';
 import { ImageService } from './images.js';
+import { MediaService } from './media.js';
 import { createMessageHandler } from './incoming.js';
+import { ProgressStream } from './progress.js';
+import { ProgressCards } from './progress-cards.js';
 
 const safeLog = (args) => args.map((value) => typeof value === 'string' ? redactSecrets(value)
   : value instanceof Error ? redactSecrets(value.stack || value.message) : value);
@@ -29,6 +32,7 @@ const wsClient = new WSClient({
 });
 
 const store = new TicketStore(config.ticketDbPath);
+const progressCards = new ProgressCards({ store, client: wsClient, config, logger: log });
 let chatReady = false;
 const scheduler = new Scheduler({
   store: new ScheduleStore(store), config, logger: log,
@@ -40,10 +44,17 @@ const bot = new TicketBot({
   config,
   logger: log,
   send: push,
-  createProgress: (frame, ticket) => new ProgressStream(frame, ticket.id),
+  createProgress: (frame, ticket, job) => new ProgressStream({
+    ticketId: ticket.id, streamId: generateReqId('stream'),
+    reply: (streamId, content, finish, templateCard) => wsClient.replyStreamWithCard(
+      frame, streamId, content, finish, templateCard ? { templateCard } : undefined),
+    fallback: (content) => push(frame, content),
+    details: progressCards.forRun(ticket, job),
+  }),
   createSession: (options) => new ClaudeSession(options),
   scheduler,
   imageService: new ImageService({ client: wsClient, allowedPaths: config.allowedPaths }),
+  fileService: new MediaService({ client: wsClient, allowedPaths: config.allowedPaths }),
 });
 
 // ---------------------------------------------------------------------------
@@ -82,59 +93,6 @@ async function sendTo(target, content) {
   await wsClient.sendMessage(target, { msgtype: 'markdown', markdown: { content } });
 }
 
-// ---------------------------------------------------------------------------
-// 流式进度：同一条消息原地刷新
-// ---------------------------------------------------------------------------
-
-class ProgressStream {
-  constructor(frame, ticketId) {
-    this.frame = frame;
-    this.ticketId = ticketId;
-    this.streamId = generateReqId('stream');
-    this.lines = [];
-    this.started = false;
-    this.closed = false;
-    this.lastSentAt = 0;
-  }
-
-  /** 追加一行进度，节流发送 */
-  async push(line) {
-    if (this.closed) return;
-    if (line) this.lines.push(line);
-    const now = Date.now();
-    if (this.started && now - this.lastSentAt < 2000) return;
-    this.lastSentAt = now;
-    this.started = true;
-    await this.#send(this.#render(), false);
-  }
-
-  /** 结束流式消息，写入最终结果 */
-  async finish(finalText) {
-    if (this.closed) return;
-    this.closed = true;
-    const ok = await this.#send(finalText, true);
-    if (!ok) {
-      // 流式通道失败（例如超时），退回到主动推送
-      await push(this.frame, finalText);
-    }
-  }
-
-  async #send(content, finish) {
-    try {
-      await wsClient.replyStream(this.frame, this.streamId, content, finish);
-      return true;
-    } catch (err) {
-      log.debug('流式发送失败', err?.message ?? err);
-      return false;
-    }
-  }
-
-  #render() {
-    const tail = this.lines.slice(-8).join('\n');
-    return `⏳ **工单 #${this.ticketId} 执行中…**\n\n${tail}`;
-  }
-}
-
 // 白名单校验覆盖所有输入，图片下载发生在鉴权之后。
 const dispatch = createMessageHandler({ config, bot, send: push, logger: log });
 
@@ -160,6 +118,11 @@ for (const type of ['text', 'voice', 'image', 'mixed']) {
     dispatch(frame).catch(() => log.error('处理消息异常'));
   });
 }
+
+wsClient.on('event.template_card_event', (frame) => {
+  // 卡片更新需在回调后 5 秒内响应，不进入工单执行队列。
+  progressCards.handle(frame).catch(() => log.warn('处理过程卡片点击失败'));
+});
 
 wsClient.on('event.enter_chat', async (frame) => {
   try {

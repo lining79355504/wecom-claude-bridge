@@ -2,14 +2,15 @@ import { ApprovalManager, renderApprovalPrompt } from './approval.js';
 import { analyzeBashCommand } from './bash-policy.js';
 import { isInside } from './guard.js';
 import { STATUS } from './tickets.js';
+import { formatProgressEvent } from './progress.js';
 
 const approvalReply = /^(?:y|yes|n|no|同意|拒绝)(?:\s|$)/i;
 const label = (ticket) => `#${ticket.id} ${ticket.title}`;
 
 /** 消息路由和串行执行器，传输层与 Claude SDK 可替换，便于离线测试。 */
 export class TicketBot {
-  constructor({ store, config, send, createProgress, createSession, logger, scheduler, imageService }) {
-    Object.assign(this, { store, config, send, createProgress, createSession, logger, scheduler, imageService });
+  constructor({ store, config, send, createProgress, createSession, logger, scheduler, imageService, fileService }) {
+    Object.assign(this, { store, config, send, createProgress, createSession, logger, scheduler, imageService, fileService });
     this.approvals = new ApprovalManager({ logger, timeoutMs: config.approvalTimeoutMs });
     this.sessions = new Map();
     this.frames = new Map();
@@ -60,6 +61,14 @@ export class TicketBot {
     }
     const [command, ...parts] = text.slice(1).split(/\s+/);
     const arg = parts.join(' ').trim();
+    if (command === 'verbose') {
+      if (arg && !['on', 'off'].includes(arg.toLowerCase())) throw new Error('用法：/verbose on 开启，/verbose off 关闭，/verbose 查看状态。');
+      if (arg) this.store.setVerbose(chatKey, arg.toLowerCase() === 'on');
+      const enabled = this.store.verbose(chatKey);
+      return this.send(frame, enabled
+        ? '详细进度：已开启。执行说明、工具调用和文本结果默认收起在同一条回复中，点击“展开过程”可翻页、刷新或收起。对后续输出立即生效，重启后保留。'
+        : '详细进度：已关闭。保留简短工具进度和最终结果。发送 /verbose on 开启。');
+    }
     if (command === 'new') {
       if (!arg && !images.length) throw new Error('用法：/new 需求描述');
       const request = arg || '请分析收到的图片。';
@@ -85,10 +94,12 @@ export class TicketBot {
         '`/resume [编号]` 恢复重启前任务或继续处理',
         '`/close [编号]` 验收并关闭',
         '`/reset` 清空当前工单 Claude 上下文，保留记录',
+        '`/verbose [on|off]` 查看、开启或关闭本聊天详细进度（执行说明和工具摘要）',
         '`/schedule help` 定时执行 Claude 任务，推送到当前聊天或群 Webhook',
         '',
         '普通消息归入当前工单；忙时补充需求会排队。所有工单串行执行。',
         '支持图片和图文（每条最多 4 张，单张 5 MiB）；可要求识图、修改图片或把本地 PNG/JPEG 发回聊天（单张 2 MiB）。',
+        '可要求把本地文件发回聊天（单个不超过 20 MiB，保留文件名）；目录请先打包。',
         `权限模式：${this.config.permissionMode}。审批请回复提示中的完整编号。`,
       ].join('\n'));
     }
@@ -110,6 +121,7 @@ export class TicketBot {
         `状态：${STATUS[ticket.status]}`,
         `工作目录：\`${ticket.workspace}\``,
         `权限模式：${this.config.permissionMode}`,
+        `详细进度：${this.store.verbose(chatKey) ? 'on' : 'off'}`,
         `待处理消息：${this.store.pending(ticket.id).length}`,
         `上下文：${ticket.session_id ? '已保存' : '新会话'}`,
         ...(this.active?.ticket.chat_key === chatKey ? [`本聊天正在执行：#${this.active.ticket.id}`] : []),
@@ -177,7 +189,9 @@ export class TicketBot {
     }
     const jobId = this.store.enqueue(ticket.id, text, images);
     this.frames.set(jobId, frame);
-    await this.send(frame, `📋 **${label(ticket)}**\n需求已保存，${this.draining ? '已排队，当前操作结束后处理' : '准备执行'}。`);
+    if (!this.store.verbose(ticket.chat_key) || this.draining) {
+      await this.send(frame, `📋 **${label(ticket)}**\n需求已保存，${this.draining ? '已排队，当前操作结束后处理' : '准备执行'}。`);
+    }
     this.kick();
   }
 
@@ -211,12 +225,12 @@ export class TicketBot {
       const active = { ticket, session, job, cancelled: false };
       this.active = active;
       session.currentFrame = frame;
-      const progress = this.createProgress(frame, ticket);
+      const progress = this.createProgress(frame, ticket, job);
       session.onEvent = (event) => {
-        if (event.kind === 'tool_use') {
-          const detail = event.input?.command ?? event.input?.file_path ?? event.input?.path ?? '';
-          void progress.push(`${event.toolName}: ${String(detail).slice(0, 150)}`);
-        }
+        if (active.cancelled || this.shuttingDown) return;
+        const verbose = this.store.verbose(ticket.chat_key);
+        const line = formatProgressEvent(event, verbose);
+        if (line) void progress.push(line, { collapsed: verbose }).catch(() => this.logger.warn('进度更新失败'));
       };
       this.store.jobState(job.id, 'running');
       this.store.setStatus(ticket.id, 'running');
@@ -279,6 +293,10 @@ export class TicketBot {
         sendImage: this.imageService ? (path, options) => {
           if (this.active?.session !== session || this.active.cancelled || this.shuttingDown) throw new Error('工单已停止，不能发送图片。');
           return this.imageService.sendImage(session.currentFrame, ticket, path, options);
+        } : undefined,
+        sendFile: this.fileService ? (path, options) => {
+          if (this.active?.session !== session || this.active.cancelled || this.shuttingDown) throw new Error('工单已停止，不能发送文件。');
+          return this.fileService.sendFile(session.currentFrame, ticket, path, options);
         } : undefined,
         logger: this.logger,
       });
